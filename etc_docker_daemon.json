@@ -1,0 +1,8 @@
+{
+  "default-runtime": "boxtool",
+  "runtimes": {
+    "boxtool": {
+      "path": "/usr/bin/local/boxtool.py"
+    }
+  }
+}
