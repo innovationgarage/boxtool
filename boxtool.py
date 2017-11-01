@@ -11,7 +11,7 @@ import tempfile
 import lxml.etree
 import sys
 import time
-import signal
+import pipes
 
 def ensuredirs(pth):
     if os.path.exists(pth):
@@ -56,14 +56,19 @@ def flatten_dict(d, prefix=''):
         else:
             res["%s%s" % (prefix, key)] = value
     return res
-    
+
+def deletePid(pidfile, status):
+    with open(pidfile + ".control", "w") as f:
+        f.write(str(status))
+
 def createPid(pidfile):
+    os.mkfifo(pidfile + ".control")
     pid1 = os.fork()
     if pid1 == 0:
         pid2 = os.fork()
         if pid2 == 0:
-            while True:
-                time.sleep(10000)
+            with open(pidfile + ".control") as f:
+                sys.exit(int(f.read()))
         else:
             with open(pidfile + ".x", "w") as f:
                 f.write(str(pid2))
@@ -141,7 +146,7 @@ def create(ctx, **kw):
     cwd = "cd '%s'" % ctx.obj['bundle_config']['process']['cwd']
     exports = "export %s;" % ' '.join("'%s'" % item for item in ctx.obj['bundle_config']['process']['env'])
     cmd = ' '.join("'%s'" % item for item in ctx.obj['bundle_config']['process']['args'])
-    ctx.obj['bundle_config']['process']['shell_cmd'] = "; ".join((cwd, exports, cmd))
+    ctx.obj['bundle_config']['process']['shell_cmd'] = pipes.quote("; ".join((cwd, exports, cmd)))
 
     # ctx.obj['bundle_config']['root']['path'] == "/path"
     # ctx.obj['bundle_config']['platform']['arch'] == "amd64"
@@ -173,23 +178,22 @@ def start(ctx, **kw):
 
     # clone_vm("boxtool-linux", "%(main_root)s/vms" % args, args["create_container_id"])
     system("vboxmanage clonevm --basefolder=%(main_root)s/vms --register --name %(create_container_id)s boxtool-linux" % args)
-    system("modprobe nbd")
-    system("qemu-nbd -d /dev/nbd0")
+    os.system("modprobe nbd")
+    os.system("qemu-nbd -d /dev/nbd0")
+    os.system("umount %(main_root)s/mnt" % args)
     system("qemu-nbd -c /dev/nbd0 %(main_root)s/vms/%(create_container_id)s/%(create_container_id)s.vdi" % args)
     system("mount /dev/nbd0p1 %(main_root)s/mnt" % args)
     system("rsync -a %(bundle_config_root_path)s/ %(main_root)s/mnt/" % args)
-    system("umount /dev/nbd0p1")
+    system("umount %(main_root)s/mnt" % args)
     system("qemu-nbd -d /dev/nbd0")
         
     system("vboxmanage startvm --type headless %(create_container_id)s" % args)
 
     args['guest_ip'] = get_guest_ip(args['create_container_id'])
 
-    system("ssh root@%(guest_ip)s '%(bundle_config_process_shell_cmd)s' < %(bundle_config_process_stdin)s > %(bundle_config_process_stdout)s 2> %(bundle_config_process_stderr)s &" % args)
+    system("ssh root@%(guest_ip)s %(bundle_config_process_shell_cmd)s < %(bundle_config_process_stdin)s > %(bundle_config_process_stdout)s 2> %(bundle_config_process_stderr)s &" % args)
 
-    with open(args['create_pid_file']) as f:
-        pid = int(f.read())
-    os.kill(pid, signal.SIGKILL)
+    deletePid(args['create_pid_file'], 0)
     
 @main.command()
 @click.argument("container_id")
@@ -205,8 +209,9 @@ def delete(ctx, **kw):
     except Exception, e:
         print e
     
-    system("modprobe nbd")
-    system("qemu-nbd -d /dev/nbd0")
+    os.system("modprobe nbd")
+    os.system("qemu-nbd -d /dev/nbd0")
+    os.system("umount %(main_root)s/mnt" % args)
     system("qemu-nbd -c /dev/nbd0 %(main_root)s/vms/%(create_container_id)s/%(create_container_id)s.vdi" % args)
     system("mount /dev/nbd0p1 %(main_root)s/mnt" % args)
     system("rsync -a %(main_root)s/mnt/ %(bundle_config_root_path)s/" % args)
