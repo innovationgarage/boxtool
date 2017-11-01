@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import lxml.etree
 import sys
+import time
+import signal
 
 def ensuredirs(pth):
     if os.path.exists(pth):
@@ -55,6 +57,20 @@ def flatten_dict(d, prefix=''):
             res["%s%s" % (prefix, key)] = value
     return res
     
+def createPid(pidfile):
+    pid1 = os.fork()
+    if pid1 == 0:
+        pid2 = os.fork()
+        if pid2 == 0:
+            while True:
+                time.sleep(10000)
+        else:
+            with open(pidfile + ".x", "w") as f:
+                f.write(str(pid2))
+            os.rename(pidfile + ".x", pidfile)
+    else:
+        while not os.path.exists(pidfile):
+            time.sleep(1)
 
 def get_guest_ip(container_id):
     return subprocess.check_output(['bash', '-c', 'vboxmanage guestproperty get %s /VirtualBox/GuestInfo/Net/1/V4/IP | sed -e "s+Value: ++g"' % container_id]).strip()
@@ -62,6 +78,12 @@ def get_guest_ip(container_id):
 
 def get_guest_path(vm):
     return subprocess.check_output(['bash', '-c', 'vboxmanage showvminfo %s | grep "Config file:" | sed -e "s+Config file:  *++g"' % vm]).strip()
+
+def get_guest_uuid(vm):
+    return subprocess.check_output(['bash', '-c', 'vboxmanage showvminfo %s | grep ^UUID:  | sed -e "s+UUID:  *++g"' % vm]).strip()
+
+def get_guest_pid(vm):
+    return subprocess.check_output(['bash', '-c', 'ps aux | grep %s | grep /usr/lib/virtualbox/VirtualBox | sed -e "s+[^ ]*  *\([0-9]*\) .*+\1+g"' % get_guest_uuid(vm)]).strip()
 
 def clone_vm(vm, basefolder, name):
     old_config_path = get_guest_path(vm)
@@ -138,15 +160,8 @@ def create(ctx, **kw):
     with open("%(main_root)s/vms/%(create_container_id)s/container.json" % args, "w") as f:
         json.dump(args, f, indent=2)
 
-    # clone_vm("boxtool-linux", "%(main_root)s/vms" % args, args["create_container_id"])
-    system("vboxmanage clonevm --basefolder=%(main_root)s/vms --register --name %(create_container_id)s boxtool-linux" % args)
-    system("modprobe nbd")
-    system("qemu-nbd -c /dev/nbd0 %(main_root)s/vms/%(create_container_id)s/%(create_container_id)s.vdi" % args)
-    system("mount /dev/nbd0p1 %(main_root)s/mnt" % args)
-    system("rsync -a %(bundle_config_root_path)s/ %(main_root)s/mnt/" % args)
-    system("umount /dev/nbd0p1")
-    system("qemu-nbd -d /dev/nbd0")
-        
+    createPid(args['create_pid_file'])
+
 @main.command()
 @click.argument("container_id")
 @click.pass_context
@@ -156,11 +171,26 @@ def start(ctx, **kw):
     with open("%(main_root)s/vms/%(start_container_id)s/container.json" % args) as f:
         args = json.load(f)
 
-    system("vboxmanage startvm --type headless %s" % container_id)
-    args['guest_ip'] = get_guest_ip(container_id)
-    
+    # clone_vm("boxtool-linux", "%(main_root)s/vms" % args, args["create_container_id"])
+    system("vboxmanage clonevm --basefolder=%(main_root)s/vms --register --name %(create_container_id)s boxtool-linux" % args)
+    system("modprobe nbd")
+    system("qemu-nbd -d /dev/nbd0")
+    system("qemu-nbd -c /dev/nbd0 %(main_root)s/vms/%(create_container_id)s/%(create_container_id)s.vdi" % args)
+    system("mount /dev/nbd0p1 %(main_root)s/mnt" % args)
+    system("rsync -a %(bundle_config_root_path)s/ %(main_root)s/mnt/" % args)
+    system("umount /dev/nbd0p1")
+    system("qemu-nbd -d /dev/nbd0")
+        
+    system("vboxmanage startvm --type headless %(create_container_id)s" % args)
+
+    args['guest_ip'] = get_guest_ip(args['create_container_id'])
+
     system("ssh root@%(guest_ip)s '%(bundle_config_process_shell_cmd)s' < %(bundle_config_process_stdin)s > %(bundle_config_process_stdout)s 2> %(bundle_config_process_stderr)s &" % args)
 
+    with open(args['create_pid_file']) as f:
+        pid = int(f.read())
+    os.kill(pid, signal.SIGKILL)
+    
 @main.command()
 @click.argument("container_id")
 @click.pass_context
@@ -176,6 +206,7 @@ def delete(ctx, **kw):
         print e
     
     system("modprobe nbd")
+    system("qemu-nbd -d /dev/nbd0")
     system("qemu-nbd -c /dev/nbd0 %(main_root)s/vms/%(create_container_id)s/%(create_container_id)s.vdi" % args)
     system("mount /dev/nbd0p1 %(main_root)s/mnt" % args)
     system("rsync -a %(main_root)s/mnt/ %(bundle_config_root_path)s/" % args)
