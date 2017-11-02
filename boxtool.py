@@ -78,8 +78,11 @@ def createPid(pidfile):
             time.sleep(1)
 
 def get_guest_ip(container_id):
-    return subprocess.check_output(['bash', '-c', 'vboxmanage guestproperty get %s /VirtualBox/GuestInfo/Net/1/V4/IP | sed -e "s+Value: ++g"' % container_id]).strip()
-
+    while True:
+        ip = subprocess.check_output(['bash', '-c', 'vboxmanage guestproperty get %s /VirtualBox/GuestInfo/Net/1/V4/IP | sed -e "s+Value: ++g"' % container_id]).strip()
+        if ip != "No value set!":
+            return ip
+        time.sleep(1)
 
 def get_guest_path(vm):
     return subprocess.check_output(['bash', '-c', 'vboxmanage showvminfo %s | grep "Config file:" | sed -e "s+Config file:  *++g"' % vm]).strip()
@@ -117,6 +120,11 @@ def clone_vm(vm, basefolder, name):
     tree.write(new_config_path)
     system("vboxmanage registervm '%s'" % new_config_path)
 
+
+def generate_ssh_key(args):
+    if not os.path.exists(args["main_ssh_priv"]):
+        system("ssh-keygen -t rsa -N '' -f '%(main_ssh_priv)s'" % args)
+       
 @click.group()
 @click.option("--root", default='/var/lib/boxtool')
 @click.option("--log")
@@ -125,6 +133,10 @@ def clone_vm(vm, basefolder, name):
 def main(ctx, **kw):
     ctx.obj = {}
     ctx.obj['main'] = kw
+    ctx.obj['main']['ssh'] = {
+        "priv": os.path.join(ctx.obj['main']['root'], "key"),
+        "pub": os.path.join(ctx.obj['main']['root'], "key.pub")
+    }
 
 @main.command()
 @click.option("--bundle")
@@ -139,14 +151,11 @@ def create(ctx, **kw):
     with open(os.path.join(kw['bundle'], "config.json")) as f:
         ctx.obj['bundle_config'] = json.load(f)
 
-    ctx.obj['bundle_config']['process']['stdin'] = os.path.join(kw['bundle'], 'init-stdin')
-    ctx.obj['bundle_config']['process']['stdout'] = os.path.join(kw['bundle'], 'init-stdout')
-    ctx.obj['bundle_config']['process']['stderr'] = os.path.join(kw['bundle'], 'init-stderr')
-
     cwd = "cd '%s'" % ctx.obj['bundle_config']['process']['cwd']
-    exports = "export %s;" % ' '.join("'%s'" % item for item in ctx.obj['bundle_config']['process']['env'])
+    exports = "export %s" % ' '.join("'%s'" % item for item in ctx.obj['bundle_config']['process']['env'])
     cmd = ' '.join("'%s'" % item for item in ctx.obj['bundle_config']['process']['args'])
-    ctx.obj['bundle_config']['process']['shell_cmd'] = pipes.quote("; ".join((cwd, exports, cmd)))
+    ctx.obj['bundle_config']['process']['shell_cmd'] = "; ".join((cwd, exports, cmd))
+    ctx.obj['bundle_config']['process']['shell_cmd_q'] = pipes.quote("; ".join((cwd, exports, cmd)))
 
     # ctx.obj['bundle_config']['root']['path'] == "/path"
     # ctx.obj['bundle_config']['platform']['arch'] == "amd64"
@@ -159,41 +168,66 @@ def create(ctx, **kw):
 
     args = flatten_dict(ctx.obj)
 
+    ensuredirs("/run/boxtool/vms/%(create_container_id)s" % args)
+    args['bundle_config_process_stdin'] = "/run/boxtool/vms/%(create_container_id)s/init-stdin" % args
+    args['bundle_config_process_stdout'] = "/run/boxtool/vms/%(create_container_id)s/init-stdout" % args
+    args['bundle_config_process_stderr'] = "/run/boxtool/vms/%(create_container_id)s/init-stderr" % args
+    
     ensuredirs("%(main_root)s/vms/%(create_container_id)s" % args)
     ensuredirs("%(main_root)s/mnt" % args)
-
+    
     with open("%(main_root)s/vms/%(create_container_id)s/container.json" % args, "w") as f:
         json.dump(args, f, indent=2)
 
+    os.link("%(create_bundle)s/init-stdin" % args, args["bundle_config_process_stdin"])
+    os.link("%(create_bundle)s/init-stdout" % args, args["bundle_config_process_stdout"])
+    os.link("%(create_bundle)s/init-stderr" % args, args["bundle_config_process_stderr"])
+
     createPid(args['create_pid_file'])
 
+    
 @main.command()
 @click.argument("container_id")
 @click.pass_context
 def start(ctx, **kw):
-    ctx.obj['start'] = kw
-    args = flatten_dict(ctx.obj)
-    with open("%(main_root)s/vms/%(start_container_id)s/container.json" % args) as f:
-        args = json.load(f)
+    pid1 = os.fork()
+    if pid1 == 0:
+        pid2 = os.fork()
+        if pid2 == 0:
+            ctx.obj['start'] = kw
+            args = flatten_dict(ctx.obj)
+            with open("%(main_root)s/vms/%(start_container_id)s/container.json" % args) as f:
+                args = json.load(f)
 
-    # clone_vm("boxtool-linux", "%(main_root)s/vms" % args, args["create_container_id"])
-    system("vboxmanage clonevm --basefolder=%(main_root)s/vms --register --name %(create_container_id)s boxtool-linux" % args)
-    os.system("modprobe nbd")
-    os.system("qemu-nbd -d /dev/nbd0")
-    os.system("umount %(main_root)s/mnt" % args)
-    system("qemu-nbd -c /dev/nbd0 %(main_root)s/vms/%(create_container_id)s/%(create_container_id)s.vdi" % args)
-    system("mount /dev/nbd0p1 %(main_root)s/mnt" % args)
-    system("rsync -a %(bundle_config_root_path)s/ %(main_root)s/mnt/" % args)
-    system("umount %(main_root)s/mnt" % args)
-    system("qemu-nbd -d /dev/nbd0")
-        
-    system("vboxmanage startvm --type headless %(create_container_id)s" % args)
+            # clone_vm("boxtool-linux", "%(main_root)s/vms" % args, args["create_container_id"])
+            system("vboxmanage clonevm --basefolder=%(main_root)s/vms --register --name %(create_container_id)s boxtool-linux" % args)
+            os.system("modprobe nbd")
+            os.system("qemu-nbd -d /dev/nbd0")
+            os.system("umount %(main_root)s/mnt" % args)
+            system("qemu-nbd -c /dev/nbd0 %(main_root)s/vms/%(create_container_id)s/%(create_container_id)s.vdi" % args)
+            system("mount /dev/nbd0p1 %(main_root)s/mnt" % args)
+            system("rsync -a %(bundle_config_root_path)s/ %(main_root)s/mnt/" % args)
 
-    args['guest_ip'] = get_guest_ip(args['create_container_id'])
+            generate_ssh_key(args)
+            system("mkdir -p %(main_root)s/mnt/root/.ssh" % args)
+            system("cp %(main_ssh_pub)s %(main_root)s/mnt/root/.ssh/authorized_keys2" % args)
+            
+            system("umount %(main_root)s/mnt" % args)
+            system("qemu-nbd -d /dev/nbd0")
 
-    system("ssh root@%(guest_ip)s %(bundle_config_process_shell_cmd)s < %(bundle_config_process_stdin)s > %(bundle_config_process_stdout)s 2> %(bundle_config_process_stderr)s &" % args)
+            system("vboxmanage startvm --type headless %(create_container_id)s" % args)
 
-    deletePid(args['create_pid_file'], 0)
+            args['guest_ip'] = get_guest_ip(args['create_container_id'])
+
+            print "PRE_WRITE", args["bundle_config_process_stdout"], "%(create_bundle)s/init-stdout" % args
+            with open(args["bundle_config_process_stdout"], "a") as f:
+                f.write("Hello world\n")
+                f.flush()
+            print "POST_WRITE"
+
+            system("ssh -i '%(main_ssh_priv)s' root@%(guest_ip)s %(bundle_config_process_shell_cmd_q)s < %(bundle_config_process_stdin)s > %(bundle_config_process_stdout)s 2> %(bundle_config_process_stderr)s" % args)
+            print "DONE", args['create_pid_file']
+            deletePid(args['create_pid_file'], 0)
     
 @main.command()
 @click.argument("container_id")
